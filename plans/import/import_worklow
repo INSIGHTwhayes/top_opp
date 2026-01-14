@@ -1,0 +1,564 @@
+# Data Import Workflow Design Document
+
+## Overview
+
+This document outlines the n8n workflows needed to populate and maintain the relationship tracking database. There are three primary entry points for data, each triggering enrichment processes that may cascade into creating other entities.
+
+**Key Principle**: Every workflow must handle the possibility that enrichment discovers entities that already exist OR need to be created. Entity resolution is the critical shared component.
+
+---
+
+## Workflow 1: Client Company Import
+
+### Trigger
+Manual input or batch CSV upload with:
+- Company name (required)
+- Client start date (required)
+- Client end date (optional, null = active)
+- Industry (optional)
+
+### Step-by-Step Process
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 1: ENTITY RESOLUTION - Does this company already exist?                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ Search Strategy (in order):                                                 │
+│   1. Exact match on name (case-insensitive)                                 │
+│   2. Fuzzy match on name (Levenshtein distance < 3)                         │
+│   3. Match on website domain if provided                                    │
+│   4. Match on LinkedIn company ID if known                                  │
+│                                                                             │
+│ Outcomes:                                                                   │
+│   → EXACT MATCH: Use existing company_id, update relationship_type          │
+│   → FUZZY MATCH: Add to manual review queue                                 │
+│   → NO MATCH: Create new company record                                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 2: CREATE OR UPDATE COMPANY RECORD                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ If NEW:                                                                     │
+│   INSERT INTO companies (name, relationship_type, client_start_date,        │
+│                          client_end_date, industry)                         │
+│   VALUES ($name, 'CLIENT', $start, $end, $industry)                         │
+│                                                                             │
+│ If EXISTS and was 'OTHER' or 'PROSPECT':                                    │
+│   UPDATE companies SET                                                      │
+│     relationship_type = 'CLIENT',                                           │
+│     client_start_date = $start,                                             │
+│     client_end_date = $end                                                  │
+│   WHERE id = $existing_id                                                   │
+│                                                                             │
+│ If EXISTS and already 'CLIENT':                                             │
+│   Log warning - possible duplicate engagement                               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 3: ENRICH - Find LinkedIn Company Page                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ Data Sources:                                                               │
+│   • Google search: "{company name} site:linkedin.com/company"               │
+│   • LinkedIn Sales Navigator API (if available)                             │
+│   • Proxycurl API (LinkedIn scraping service)                               │
+│                                                                             │
+│ Extract:                                                                    │
+│   • LinkedIn company URL → store in companies.linkedin_url                  │
+│   • LinkedIn company ID → extract from URL, useful for dedup                │
+│   • Website URL → store in companies.website                                │
+│   • Employee count range                                                    │
+│   • Headquarters location                                                   │
+│                                                                             │
+│ Note: This step can be rate-limited. Consider queuing.                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 4: ENRICH - Find PE Ownership (Current + Historical)                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ Data Sources (in order of reliability):                                     │
+│   • PitchBook API (best, but expensive)                                     │
+│   • Crunchbase API                                                          │
+│   • PrivCo                                                                  │
+│   • Google search: "{company name} private equity acquisition"              │
+│   • Press releases on company website                                       │
+│                                                                             │
+│ For EACH PE firm found:                                                     │
+│   1. Check if PE firm exists in database (entity resolution)                │
+│   2. If not, TRIGGER → PE Firm Import Workflow (but don't cascade deeply)   │
+│   3. Create pe_ownership_history record:                                    │
+│      - pe_firm_id                                                           │
+│      - company_id                                                           │
+│      - acquisition_date (or approximate_acquisition_year)                   │
+│      - exit_date (null if current, or approximate_exit_year)                │
+│      - ownership_percentage (if known)                                      │
+│      - investment_type (MAJORITY, MINORITY, etc.)                           │
+│                                                                             │
+│ ⚠️  CASCADE CONTROL: When creating PE firm from this workflow,              │
+│     do NOT trigger full PE enrichment (portfolio discovery).                │
+│     Just create the basic PE firm record.                                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 5: ENRICH - Find Current Leadership Team                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ Data Sources:                                                               │
+│   • LinkedIn company page → "People" section filtered by title              │
+│   • Company website "About" or "Leadership" page                            │
+│   • Crunchbase people section                                               │
+│   • ZoomInfo / Apollo.io (commercial APIs)                                  │
+│                                                                             │
+│ Target Titles (configure based on your needs):                              │
+│   • C-Suite: CEO, CFO, COO, CTO, CMO, CHRO, CRO                             │
+│   • VPs: VP of Sales, VP of Engineering, etc.                               │
+│   • Founders                                                                │
+│                                                                             │
+│ For EACH person found:                                                      │
+│   1. TRIGGER → Person Import Workflow (lightweight version)                 │
+│   2. Create employment_history record:                                      │
+│      - person_id                                                            │
+│      - company_id                                                           │
+│      - title                                                                │
+│      - seniority_level = 'C-SUITE' or 'VP'                                  │
+│      - is_leadership = TRUE                                                 │
+│      - is_current = TRUE                                                    │
+│      - start_date (if discoverable)                                         │
+│                                                                             │
+│ ⚠️  CASCADE CONTROL: Person Import here should be LIGHTWEIGHT:              │
+│     - Create person record with LinkedIn URL                                │
+│     - Do NOT scrape their full employment history                           │
+│     - Queue for "deep enrichment" later if desired                          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ STEP 6: ENRICH - Find Board Members                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ Data Sources:                                                               │
+│   • Company website "Board of Directors" page                               │
+│   • LinkedIn: Search for people with company + "Board" in title             │
+│   • SEC filings (for larger companies)                                      │
+│   • PitchBook / BoardEx (commercial)                                        │
+│                                                                             │
+│ For EACH board member found:                                                │
+│   1. TRIGGER → Person Import Workflow (lightweight)                         │
+│   2. Create board_memberships record:                                       │
+│      - person_id                                                            │
+│      - company_id                                                           │
+│      - role (Board Member, Chairman, Observer)                              │
+│      - is_current = TRUE                                                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Output
+- Company record created/updated with `relationship_type = 'CLIENT'`
+- LinkedIn URL and ID populated
+- PE ownership history records created
+- Leadership team linked via employment_history
+- Board members linked via board_memberships
+
+---
+
+## Workflow 2: PE Firm Import
+
+### Trigger
+- Manual input with PE firm name
+- Automatic trigger from Client Import (Step 4) when new PE firm discovered
+- Batch import from PE database export
+
+### Process Variants
+
+**FULL IMPORT** (when PE firm is itself a client or priority target):
+```
+1. Entity Resolution → Create/Find PE firm record
+2. Set is_client = TRUE if they're a client
+3. Enrich: Find current portfolio companies
+4. Enrich: Find exited investments
+5. Enrich: Find PE professionals (partners, principals, associates)
+6. For each portfolio company → Queue for potential Client Import
+7. For each PE professional → Lightweight Person Import
+```
+
+**LIGHTWEIGHT IMPORT** (when discovered via Client Import):
+```
+1. Entity Resolution → Create/Find PE firm record
+2. Populate basic info (name, website, firm_type)
+3. STOP - do not discover portfolio or professionals
+4. Flag for "full enrichment later" if desired
+```
+
+### Data Sources for PE Enrichment
+| Data Point | Primary Source | Fallback |
+|------------|---------------|----------|
+| Portfolio companies | PitchBook | Crunchbase, PE firm website |
+| Exit history | PitchBook | Press releases, Google News |
+| PE professionals | LinkedIn company page | PE firm website "Team" page |
+| AUM / Fund size | PitchBook | SEC Form D filings |
+
+### Cascade Control
+The biggest risk with PE Import is infinite loops:
+- PE Firm A owns Company X
+- Company X was previously owned by PE Firm B
+- PE Firm B owns Company Y
+- Company Y is owned by PE Firm A... (loop!)
+
+**Solution**: Track "import depth" in the workflow:
+```
+depth = 0  → Full import allowed
+depth = 1  → Lightweight import only (no portfolio discovery)
+depth >= 2 → Just create stub record, no enrichment
+```
+
+---
+
+## Workflow 3: Person Import
+
+### Trigger
+- Manual input with name (and optionally current company)
+- Automatic trigger from Client Import (leadership/board discovery)
+- Automatic trigger from PE Import (professionals discovery)
+- Batch import from CRM export
+
+### Process Variants
+
+**FULL IMPORT** (for key relationship contacts):
+```
+1. Search LinkedIn for profile
+2. Entity Resolution → Create/Find person record
+3. Store LinkedIn URL and extract LinkedIn ID
+4. Enrich: Scrape full employment history from LinkedIn
+5. For each past employer:
+   a. Entity Resolution for company
+   b. Create company stub if needed (don't enrich)
+   c. Create employment_history record with dates
+6. Enrich: Find board seats
+7. Link to any existing companies in your database
+```
+
+**LIGHTWEIGHT IMPORT** (when discovered via other workflows):
+```
+1. Search LinkedIn for profile
+2. Entity Resolution → Create/Find person record
+3. Store LinkedIn URL and extract LinkedIn ID
+4. Create single employment_history record for KNOWN company only
+5. STOP - do not scrape full history
+6. Queue for "deep enrichment" later
+```
+
+### LinkedIn as the Deduplication Key
+
+LinkedIn ID is your best tool for preventing duplicate people:
+
+```
+Extract LinkedIn ID from URL:
+  https://www.linkedin.com/in/john-smith-12345/
+                                 ↓
+  linkedin_id = "john-smith-12345"
+```
+
+**Entity Resolution Order for People**:
+1. Exact match on `linkedin_id` → Definitely same person
+2. Exact match on `email` → Very likely same person
+3. Match on `full_name` + `current_company` → Probably same person (needs review)
+4. Match on `full_name` alone → Queue for manual review
+
+### Employment History Extraction
+
+When scraping LinkedIn employment history, you'll get entries like:
+```json
+{
+  "title": "VP of Engineering",
+  "company_name": "Acme Corp",
+  "company_linkedin_id": "acme-corp",
+  "start_date": "2019-06",
+  "end_date": null,
+  "is_current": true
+}
+```
+
+For EACH entry:
+1. **Company Entity Resolution**:
+   - Search your `companies` table by `linkedin_url` containing the company_linkedin_id
+   - If not found, search by company_name (fuzzy)
+   - If still not found, create a STUB company record:
+     ```sql
+     INSERT INTO companies (name, relationship_type, linkedin_url)
+     VALUES ($company_name, 'OTHER', $linkedin_url)
+     ```
+   - Do NOT trigger full company enrichment (cascade control)
+
+2. **Create Employment Record**:
+   ```sql
+   INSERT INTO employment_history 
+     (person_id, company_id, title, start_date, end_date)
+   VALUES ($person_id, $company_id, $title, $start, $end)
+   ```
+
+---
+
+## Entity Resolution: The Critical Shared Component
+
+Every workflow relies on answering: "Does this entity already exist?"
+
+### Company Resolution
+```
+┌─────────────────────────────────────────────────────────────┐
+│ INPUT: company_name, optional: website, linkedin_url        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ SEARCH 1: Exact match on linkedin_url                       │
+│   → If found: RETURN existing company_id (confidence: HIGH) │
+│                                                             │
+│ SEARCH 2: Exact match on website domain                     │
+│   → If found: RETURN existing company_id (confidence: HIGH) │
+│                                                             │
+│ SEARCH 3: Exact match on name (case-insensitive, trimmed)   │
+│   → If found: RETURN existing company_id (confidence: HIGH) │
+│                                                             │
+│ SEARCH 4: Fuzzy match on name (Levenshtein ≤ 3)             │
+│   → If 1 result: RETURN with confidence: MEDIUM             │
+│   → If multiple: ADD TO REVIEW QUEUE                        │
+│                                                             │
+│ SEARCH 5: Name contains/contained by (for "Inc", "LLC")     │
+│   → "Acme" matches "Acme, Inc." and "Acme Corporation"      │
+│   → If found: RETURN with confidence: MEDIUM                │
+│                                                             │
+│ DEFAULT: RETURN null (create new record)                    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Person Resolution
+```
+┌─────────────────────────────────────────────────────────────┐
+│ INPUT: name, optional: email, linkedin_url, current_company │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ SEARCH 1: Exact match on linkedin_id (extracted from URL)   │
+│   → If found: RETURN existing person_id (confidence: HIGH)  │
+│                                                             │
+│ SEARCH 2: Exact match on email                              │
+│   → If found: RETURN existing person_id (confidence: HIGH)  │
+│                                                             │
+│ SEARCH 3: Exact name + currently at same company            │
+│   → If found: RETURN with confidence: MEDIUM                │
+│                                                             │
+│ SEARCH 4: Exact name match only                             │
+│   → If 1 result: ADD TO REVIEW QUEUE (common names!)        │
+│   → If multiple: ADD TO REVIEW QUEUE                        │
+│                                                             │
+│ DEFAULT: RETURN null (create new record)                    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### PE Firm Resolution
+```
+┌─────────────────────────────────────────────────────────────┐
+│ INPUT: pe_firm_name, optional: website                      │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ SEARCH 1: Exact match on name                               │
+│   → If found: RETURN existing pe_firm_id                    │
+│                                                             │
+│ SEARCH 2: Fuzzy match (handle "Partners" vs "Capital" etc)  │
+│   → "Summit Partners" ≠ "Summit Capital"                    │
+│   → But "Bain Capital" = "Bain Capital, LP"                 │
+│                                                             │
+│ SEARCH 3: Website domain match                              │
+│   → If found: RETURN existing pe_firm_id                    │
+│                                                             │
+│ DEFAULT: RETURN null (create new record)                    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Manual Review Queue
+
+Some entity resolutions can't be automated. Create a simple queue table:
+
+```sql
+CREATE TABLE entity_review_queue (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    
+    entity_type VARCHAR(20) NOT NULL,  -- 'COMPANY', 'PERSON', 'PE_FIRM'
+    
+    -- The incoming data
+    incoming_data JSONB NOT NULL,
+    
+    -- The potential matches found
+    potential_matches JSONB,  -- Array of {id, name, confidence_score, match_reason}
+    
+    -- Workflow context
+    source_workflow VARCHAR(100),
+    triggered_by_entity_id UUID,
+    
+    -- Resolution
+    status VARCHAR(20) DEFAULT 'PENDING',  -- 'PENDING', 'RESOLVED', 'SKIPPED'
+    resolved_entity_id UUID,  -- The chosen match, or new ID if created
+    resolved_by VARCHAR(100),
+    resolved_at TIMESTAMP,
+    
+    created_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+In n8n, you can build a simple UI workflow that:
+1. Fetches pending review items
+2. Shows the incoming data and potential matches
+3. Lets you choose: "Match to existing", "Create new", or "Skip"
+4. Updates the queue and resumes the paused import
+
+---
+
+## Workflow Orchestration in n8n
+
+### Recommended Workflow Structure
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    MAIN WORKFLOWS                           │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. client_import_full                                      │
+│     - Webhook trigger for single client                     │
+│     - Calls sub-workflows for each enrichment step          │
+│                                                             │
+│  2. client_import_batch                                     │
+│     - Triggered by CSV upload                               │
+│     - Loops through rows, calls client_import_full each     │
+│                                                             │
+│  3. pe_firm_import_full                                     │
+│     - For PE firms that are clients                         │
+│     - Full portfolio discovery                              │
+│                                                             │
+│  4. pe_firm_import_lightweight                              │
+│     - Called by other workflows                             │
+│     - Just creates stub record                              │
+│                                                             │
+│  5. person_import_full                                      │
+│     - For key relationship contacts                         │
+│     - Full employment history scrape                        │
+│                                                             │
+│  6. person_import_lightweight                               │
+│     - Called by other workflows                             │
+│     - Just creates stub with LinkedIn URL                   │
+│                                                             │
+│  7. manual_review_processor                                 │
+│     - UI for resolving entity matches                       │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                    SUB-WORKFLOWS (shared)                   │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  • entity_resolution_company                                │
+│  • entity_resolution_person                                 │
+│  • entity_resolution_pe_firm                                │
+│  • enrich_linkedin_company                                  │
+│  • enrich_linkedin_person                                   │
+│  • enrich_pe_ownership                                      │
+│  • enrich_company_leadership                                │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                    ENRICHMENT QUEUES                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Some enrichment should be queued (rate limits, cost):      │
+│                                                             │
+│  • linkedin_scrape_queue                                    │
+│    - Processes 100 profiles/day to avoid rate limits        │
+│                                                             │
+│  • pitchbook_lookup_queue                                   │
+│    - Batches API calls to manage costs                      │
+│                                                             │
+│  • deep_enrichment_queue                                    │
+│    - People/companies flagged for full enrichment later     │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Passing Depth Context
+
+When workflows call each other, pass a `depth` parameter:
+
+```javascript
+// In client_import_full, when discovering a new PE firm:
+{
+  "workflow": "pe_firm_import_lightweight",
+  "params": {
+    "pe_firm_name": "Bain Capital",
+    "source_workflow": "client_import_full",
+    "source_entity_id": "{{$company_id}}",
+    "depth": 1  // Prevents cascading enrichment
+  }
+}
+```
+
+In the receiving workflow:
+```javascript
+// At the start of pe_firm_import
+if (depth >= 2) {
+  // Just create stub, no enrichment
+  return createStubOnly(pe_firm_name);
+}
+
+if (depth === 1) {
+  // Lightweight: basic info only
+  return lightweightImport(pe_firm_name);
+}
+
+// depth === 0: Full import
+return fullImport(pe_firm_name);
+```
+
+---
+
+## Data Source Summary
+
+| Data Point | Free Options | Paid Options |
+|------------|--------------|--------------|
+| LinkedIn company info | Google search + scrape | Proxycurl ($), Sales Navigator |
+| LinkedIn person profile | Google search + scrape | Proxycurl ($), Sales Navigator |
+| LinkedIn employment history | Manual or Proxycurl | Proxycurl ($20/1000 profiles) |
+| PE ownership | Google News, press releases | PitchBook ($$$), Crunchbase ($) |
+| PE portfolio | PE firm websites | PitchBook ($$$) |
+| Board members | Company websites, SEC | BoardEx ($$$), PitchBook |
+| Contact info (email) | Hunter.io (limited free) | Apollo.io, ZoomInfo |
+
+### Realistic Starting Point
+
+For a bootstrapped approach, I'd suggest:
+
+1. **LinkedIn**: Use Proxycurl API (~$20 per 1000 lookups) for profile data. Much more reliable than scraping.
+
+2. **PE Ownership**: Start with manual research + Google. Graduate to Crunchbase API ($99/mo) when volume justifies it.
+
+3. **Entity Resolution**: Build it yourself with fuzzy matching (pg_trgm extension in PostgreSQL is great for this).
+
+---
+
+## Next Steps
+
+1. **Start with Client Import workflow** - this is your core use case
+2. **Build Entity Resolution first** - every other workflow depends on it
+3. **Use queues liberally** - LinkedIn rate limits will bite you
+4. **Manual review is okay** - better to review edge cases than create duplicates
+5. **Depth limits are critical** - without them, you'll have infinite loops
+
+Would you like me to detail the specific n8n nodes for any of these workflows?

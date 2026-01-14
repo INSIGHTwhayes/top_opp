@@ -1,0 +1,444 @@
+-- =============================================================================
+-- CONSULTING FIRM RELATIONSHIP TRACKING SCHEMA
+-- =============================================================================
+-- A unified schema for tracking temporal relationships between people,
+-- companies, and private equity firms. Designed to find connections between
+-- your existing client network and prospective clients.
+--
+-- Key Design Decisions:
+-- 1. Single unified schema (not separate schemas for clients vs prospects)
+-- 2. SCD Type 2 pattern for temporal tracking (start_date, end_date, is_current)
+-- 3. Companies tagged as CLIENT, PROSPECT, or OTHER (not separate tables)
+-- 4. People and PE firms are shared entities that can connect both sides
+-- =============================================================================
+
+-- =============================================================================
+-- CORE ENTITY TABLES
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- COMPANIES
+-- The central entity - can be tagged as client, prospect, or other
+-- -----------------------------------------------------------------------------
+CREATE TABLE companies (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    -- Basic information
+    name VARCHAR(255) NOT NULL,
+    legal_name VARCHAR(255),
+    website VARCHAR(500),
+    linkedin_url VARCHAR(500),
+
+    -- Classification
+    industry VARCHAR(100),
+    sub_industry VARCHAR(100),
+    employee_count_range VARCHAR(50),  -- e.g., '100-500', '1000-5000'
+    headquarters_city VARCHAR(100),
+    headquarters_state VARCHAR(100),
+    headquarters_country VARCHAR(100) DEFAULT 'USA',
+
+    -- Your relationship to this company
+    relationship_type VARCHAR(20) NOT NULL DEFAULT 'OTHER'
+        CHECK (relationship_type IN ('CLIENT', 'PROSPECT', 'OTHER')),
+
+    -- If CLIENT: when did they become/stop being a client?
+    client_start_date DATE,
+    client_end_date DATE,
+    -- Note: is_active_client is computed by trigger since CURRENT_DATE is not immutable
+    is_active_client BOOLEAN DEFAULT FALSE,
+
+    -- If PROSPECT: tracking info
+    prospect_added_date DATE,
+    prospect_status VARCHAR(50),  -- e.g., 'RESEARCHING', 'QUALIFIED', 'PITCHED', 'CLOSED'
+
+    -- Metadata
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Indexes for company queries
+CREATE INDEX idx_companies_relationship ON companies(relationship_type);
+CREATE INDEX idx_companies_active_client ON companies(is_active_client) WHERE is_active_client = TRUE;
+CREATE INDEX idx_companies_name ON companies(name);
+CREATE INDEX idx_companies_industry ON companies(industry);
+
+-- -----------------------------------------------------------------------------
+-- PRIVATE EQUITY FIRMS
+-- -----------------------------------------------------------------------------
+CREATE TABLE pe_firms (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    -- Basic information
+    name VARCHAR(255) NOT NULL,
+    website VARCHAR(500),
+    linkedin_url VARCHAR(500),
+
+    -- Classification
+    firm_type VARCHAR(50),  -- e.g., 'BUYOUT', 'GROWTH', 'VENTURE', 'CREDIT'
+    aum_millions DECIMAL(15, 2),  -- Assets under management
+    headquarters_city VARCHAR(100),
+    headquarters_country VARCHAR(100) DEFAULT 'USA',
+
+    -- Your relationship
+    is_client BOOLEAN DEFAULT FALSE,  -- Is this PE firm itself a client?
+    relationship_notes TEXT,
+
+    -- Metadata
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_pe_firms_name ON pe_firms(name);
+CREATE INDEX idx_pe_firms_client ON pe_firms(is_client) WHERE is_client = TRUE;
+
+-- -----------------------------------------------------------------------------
+-- PEOPLE (CONTACTS)
+-- Shared across all companies - a person can work at clients AND prospects
+-- -----------------------------------------------------------------------------
+CREATE TABLE people (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    -- Identity
+    first_name VARCHAR(100) NOT NULL,
+    last_name VARCHAR(100) NOT NULL,
+    full_name VARCHAR(255) GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED,
+
+    -- Contact information
+    email VARCHAR(255),
+    phone VARCHAR(50),
+    linkedin_url VARCHAR(500),
+
+    -- For matching/deduplication
+    linkedin_id VARCHAR(100),  -- Extracted from LinkedIn URL, useful for dedup
+
+    -- Metadata
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_people_name ON people(last_name, first_name);
+CREATE INDEX idx_people_email ON people(email) WHERE email IS NOT NULL;
+CREATE INDEX idx_people_linkedin ON people(linkedin_id) WHERE linkedin_id IS NOT NULL;
+
+-- =============================================================================
+-- RELATIONSHIP TABLES (with temporal tracking)
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- EMPLOYMENT HISTORY
+-- Tracks who worked where and when (SCD Type 2)
+-- -----------------------------------------------------------------------------
+CREATE TABLE employment_history (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    -- Foreign keys
+    person_id UUID NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+
+    -- Role information
+    title VARCHAR(200),
+    department VARCHAR(100),
+    seniority_level VARCHAR(50),  -- e.g., 'C-SUITE', 'VP', 'DIRECTOR', 'MANAGER', 'STAFF'
+    is_leadership BOOLEAN DEFAULT FALSE,  -- Quick flag for C-suite/executives
+
+    -- Temporal tracking (SCD Type 2)
+    start_date DATE,
+    end_date DATE,  -- NULL means current
+    is_current BOOLEAN GENERATED ALWAYS AS (end_date IS NULL) STORED,
+
+    -- Status for simpler queries
+    status VARCHAR(20) GENERATED ALWAYS AS (
+        CASE WHEN end_date IS NULL THEN 'CURRENT' ELSE 'FORMER' END
+    ) STORED,
+
+    -- When we don't have exact dates
+    approximate_start_year INTEGER,
+    approximate_end_year INTEGER,
+    tenure_notes VARCHAR(255),  -- e.g., "roughly 3 years", "early 2010s"
+
+    -- Metadata
+    source VARCHAR(100),  -- Where did this info come from? LinkedIn, manual entry, etc.
+    confidence VARCHAR(20) DEFAULT 'MEDIUM'
+        CHECK (confidence IN ('HIGH', 'MEDIUM', 'LOW')),
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Critical indexes for employment queries
+CREATE INDEX idx_employment_person ON employment_history(person_id);
+CREATE INDEX idx_employment_company ON employment_history(company_id);
+CREATE INDEX idx_employment_current ON employment_history(person_id, is_current) WHERE is_current = TRUE;
+CREATE INDEX idx_employment_status ON employment_history(status);
+CREATE INDEX idx_employment_dates ON employment_history(start_date, end_date);
+CREATE INDEX idx_employment_company_status ON employment_history(company_id, status);
+
+-- Composite index for connection queries
+CREATE INDEX idx_employment_connection ON employment_history(person_id, company_id, status);
+
+-- -----------------------------------------------------------------------------
+-- PE OWNERSHIP HISTORY
+-- Tracks which PE firms owned which companies and when
+-- -----------------------------------------------------------------------------
+CREATE TABLE pe_ownership_history (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    -- Foreign keys
+    pe_firm_id UUID NOT NULL REFERENCES pe_firms(id) ON DELETE CASCADE,
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+
+    -- Ownership details
+    ownership_percentage DECIMAL(5, 2),  -- e.g., 75.50 for 75.5%
+    investment_type VARCHAR(50),  -- e.g., 'MAJORITY', 'MINORITY', 'PLATFORM', 'ADD-ON'
+    deal_type VARCHAR(50),  -- e.g., 'BUYOUT', 'GROWTH', 'RECAP'
+
+    -- Temporal tracking
+    acquisition_date DATE,
+    exit_date DATE,  -- NULL means current holding
+    is_current_holding BOOLEAN GENERATED ALWAYS AS (exit_date IS NULL) STORED,
+
+    status VARCHAR(20) GENERATED ALWAYS AS (
+        CASE WHEN exit_date IS NULL THEN 'CURRENT' ELSE 'EXITED' END
+    ) STORED,
+
+    -- When we don't have exact dates
+    approximate_acquisition_year INTEGER,
+    approximate_exit_year INTEGER,
+
+    -- Metadata
+    source VARCHAR(100),
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Indexes for PE ownership queries
+CREATE INDEX idx_pe_ownership_firm ON pe_ownership_history(pe_firm_id);
+CREATE INDEX idx_pe_ownership_company ON pe_ownership_history(company_id);
+CREATE INDEX idx_pe_ownership_current ON pe_ownership_history(pe_firm_id, is_current_holding)
+    WHERE is_current_holding = TRUE;
+CREATE INDEX idx_pe_ownership_status ON pe_ownership_history(status);
+
+-- =============================================================================
+-- OPTIONAL: ADDITIONAL RELATIONSHIP TABLES
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- BOARD MEMBERSHIPS
+-- Tracks board seats (another connection path)
+-- -----------------------------------------------------------------------------
+CREATE TABLE board_memberships (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    person_id UUID NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+
+    role VARCHAR(100),  -- e.g., 'BOARD MEMBER', 'CHAIRMAN', 'OBSERVER'
+
+    start_date DATE,
+    end_date DATE,
+    is_current BOOLEAN GENERATED ALWAYS AS (end_date IS NULL) STORED,
+
+    source VARCHAR(100),
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_board_person ON board_memberships(person_id);
+CREATE INDEX idx_board_company ON board_memberships(company_id);
+
+-- -----------------------------------------------------------------------------
+-- PE FIRM PROFESSIONALS
+-- Track who works at PE firms (for PE-side connections)
+-- -----------------------------------------------------------------------------
+CREATE TABLE pe_professionals (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    person_id UUID NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    pe_firm_id UUID NOT NULL REFERENCES pe_firms(id) ON DELETE CASCADE,
+
+    title VARCHAR(200),
+
+    start_date DATE,
+    end_date DATE,
+    is_current BOOLEAN GENERATED ALWAYS AS (end_date IS NULL) STORED,
+    status VARCHAR(20) GENERATED ALWAYS AS (
+        CASE WHEN end_date IS NULL THEN 'CURRENT' ELSE 'FORMER' END
+    ) STORED,
+
+    source VARCHAR(100),
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_pe_prof_person ON pe_professionals(person_id);
+CREATE INDEX idx_pe_prof_firm ON pe_professionals(pe_firm_id);
+
+-- =============================================================================
+-- UTILITY TABLES
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- CONNECTION CACHE
+-- Pre-computed connections for frequently queried client-prospect pairs
+-- -----------------------------------------------------------------------------
+CREATE TABLE connection_cache (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    -- The two companies being connected
+    client_company_id UUID NOT NULL REFERENCES companies(id),
+    prospect_company_id UUID NOT NULL REFERENCES companies(id),
+
+    -- Connection details
+    connection_type VARCHAR(100) NOT NULL,
+    -- e.g., 'FORMER_EMPLOYEE_NOW_AT_PROSPECT', 'SHARED_PE_OWNER', 'MUTUAL_FORMER_EMPLOYEE'
+
+    connector_person_id UUID REFERENCES people(id),
+    connector_pe_firm_id UUID REFERENCES pe_firms(id),
+
+    -- Scoring
+    recency_score DECIMAL(3, 2),  -- 0.00 to 1.00
+    connection_strength DECIMAL(3, 2),
+
+    -- Full path details as JSON
+    path_details JSONB,
+
+    -- Cache management
+    computed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_cache_client ON connection_cache(client_company_id);
+CREATE INDEX idx_cache_prospect ON connection_cache(prospect_company_id);
+CREATE INDEX idx_cache_strength ON connection_cache(connection_strength DESC);
+
+-- Unique index to prevent duplicate connections (handles NULL values properly)
+CREATE UNIQUE INDEX idx_cache_unique_connection ON connection_cache(
+    client_company_id,
+    prospect_company_id,
+    connection_type,
+    COALESCE(connector_person_id, '00000000-0000-0000-0000-000000000000'),
+    COALESCE(connector_pe_firm_id, '00000000-0000-0000-0000-000000000000')
+);
+
+-- =============================================================================
+-- HELPER VIEWS
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- View: Current employees at client companies
+-- -----------------------------------------------------------------------------
+CREATE VIEW v_client_current_employees AS
+SELECT
+    c.id AS company_id,
+    c.name AS company_name,
+    p.id AS person_id,
+    p.full_name,
+    p.email,
+    p.linkedin_url,
+    eh.title,
+    eh.seniority_level,
+    eh.is_leadership,
+    eh.start_date
+FROM companies c
+JOIN employment_history eh ON c.id = eh.company_id
+JOIN people p ON eh.person_id = p.id
+WHERE c.relationship_type = 'CLIENT'
+  AND eh.is_current = TRUE;
+
+-- -----------------------------------------------------------------------------
+-- View: All people connected to client companies (current and former)
+-- -----------------------------------------------------------------------------
+CREATE VIEW v_client_network AS
+SELECT
+    c.id AS company_id,
+    c.name AS company_name,
+    p.id AS person_id,
+    p.full_name,
+    p.email,
+    p.linkedin_url,
+    eh.title,
+    eh.status,
+    eh.start_date,
+    eh.end_date,
+    eh.is_current
+FROM companies c
+JOIN employment_history eh ON c.id = eh.company_id
+JOIN people p ON eh.person_id = p.id
+WHERE c.relationship_type = 'CLIENT';
+
+-- -----------------------------------------------------------------------------
+-- View: Current PE ownership of companies
+-- -----------------------------------------------------------------------------
+CREATE VIEW v_current_pe_ownership AS
+SELECT
+    c.id AS company_id,
+    c.name AS company_name,
+    c.relationship_type,
+    pe.id AS pe_firm_id,
+    pe.name AS pe_firm_name,
+    poh.ownership_percentage,
+    poh.acquisition_date
+FROM companies c
+JOIN pe_ownership_history poh ON c.id = poh.company_id
+JOIN pe_firms pe ON poh.pe_firm_id = pe.id
+WHERE poh.is_current_holding = TRUE;
+
+-- =============================================================================
+-- TRIGGER: Auto-update updated_at timestamp
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+CREATE TRIGGER update_companies_updated_at BEFORE UPDATE ON companies
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_people_updated_at BEFORE UPDATE ON people
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_pe_firms_updated_at BEFORE UPDATE ON pe_firms
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_employment_updated_at BEFORE UPDATE ON employment_history
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_pe_ownership_updated_at BEFORE UPDATE ON pe_ownership_history
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- =============================================================================
+-- TRIGGER: Compute is_active_client on companies
+-- =============================================================================
+-- This uses CURRENT_DATE which cannot be in a generated column (not immutable)
+
+CREATE OR REPLACE FUNCTION compute_is_active_client()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.is_active_client := (
+        NEW.relationship_type = 'CLIENT'
+        AND NEW.client_start_date IS NOT NULL
+        AND (NEW.client_end_date IS NULL OR NEW.client_end_date > CURRENT_DATE)
+    );
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+CREATE TRIGGER compute_companies_is_active_client BEFORE INSERT OR UPDATE ON companies
+    FOR EACH ROW EXECUTE FUNCTION compute_is_active_client();
+
+-- =============================================================================
+-- COMPLETION NOTICE
+-- =============================================================================
+DO $$
+BEGIN
+    RAISE NOTICE 'Schema created successfully!';
+    RAISE NOTICE 'Tables: companies, people, pe_firms, employment_history, pe_ownership_history, board_memberships, pe_professionals, connection_cache';
+    RAISE NOTICE 'Views: v_client_current_employees, v_client_network, v_current_pe_ownership';
+END
+$$;

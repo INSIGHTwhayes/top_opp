@@ -1,0 +1,99 @@
+erDiagram
+    COMPANIES {
+        uuid id PK
+        varchar name
+        varchar relationship_type "CLIENT | PROSPECT | OTHER"
+        date client_start_date
+        date client_end_date
+        boolean is_active_client
+        varchar industry
+        varchar headquarters_city
+    }
+    
+    PEOPLE {
+        uuid id PK
+        varchar first_name
+        varchar last_name
+        varchar full_name
+        varchar email
+        varchar linkedin_url
+    }
+    
+    PE_FIRMS {
+        uuid id PK
+        varchar name
+        boolean is_client
+        varchar firm_type
+        decimal aum_millions
+    }
+    
+    EMPLOYMENT_HISTORY {
+        uuid id PK
+        uuid person_id FK
+        uuid company_id FK
+        varchar title
+        varchar seniority_level
+        boolean is_leadership
+        date start_date
+        date end_date
+        boolean is_current
+        varchar status "CURRENT | FORMER"
+    }
+    
+    PE_OWNERSHIP_HISTORY {
+        uuid id PK
+        uuid pe_firm_id FK
+        uuid company_id FK
+        decimal ownership_percentage
+        varchar investment_type
+        date acquisition_date
+        date exit_date
+        boolean is_current_holding
+        varchar status "CURRENT | EXITED"
+    }
+    
+    BOARD_MEMBERSHIPS {
+        uuid id PK
+        uuid person_id FK
+        uuid company_id FK
+        varchar role
+        date start_date
+        date end_date
+        boolean is_current
+    }
+    
+    PE_PROFESSIONALS {
+        uuid id PK
+        uuid person_id FK
+        uuid pe_firm_id FK
+        varchar title
+        date start_date
+        date end_date
+        boolean is_current
+    }
+    
+    CONNECTION_CACHE {
+        uuid id PK
+        uuid client_company_id FK
+        uuid prospect_company_id FK
+        varchar connection_type
+        uuid connector_person_id FK
+        decimal connection_strength
+        jsonb path_details
+    }
+
+    PEOPLE ||--o{ EMPLOYMENT_HISTORY : "has"
+    COMPANIES ||--o{ EMPLOYMENT_HISTORY : "employs"
+    
+    PE_FIRMS ||--o{ PE_OWNERSHIP_HISTORY : "owns"
+    COMPANIES ||--o{ PE_OWNERSHIP_HISTORY : "owned by"
+    
+    PEOPLE ||--o{ BOARD_MEMBERSHIPS : "serves on"
+    COMPANIES ||--o{ BOARD_MEMBERSHIPS : "has board"
+    
+    PEOPLE ||--o{ PE_PROFESSIONALS : "works at"
+    PE_FIRMS ||--o{ PE_PROFESSIONALS : "employs"
+    
+    COMPANIES ||--o{ CONNECTION_CACHE : "client"
+    COMPANIES ||--o{ CONNECTION_CACHE : "prospect"
+    PEOPLE ||--o{ CONNECTION_CACHE : "connector"

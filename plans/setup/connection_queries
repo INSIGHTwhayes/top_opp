@@ -1,0 +1,518 @@
+-- =============================================================================
+-- CONNECTION FINDING QUERIES
+-- =============================================================================
+-- These queries find mutual connections between your client network and a
+-- prospective client. Each query targets a specific type of connection.
+--
+-- Usage: Replace the parameter placeholders with actual UUIDs:
+--   - $prospect_id: The UUID of the prospect company you're researching
+--   - $client_id: A specific client company UUID (where applicable)
+-- =============================================================================
+
+
+-- =============================================================================
+-- QUERY 1: Former employee of ANY client now works at prospect
+-- =============================================================================
+-- This is your strongest connection type: someone who worked at one of your
+-- clients is now at the prospect company.
+-- =============================================================================
+
+SELECT 
+    p.full_name AS connector_name,
+    p.email,
+    p.linkedin_url,
+    
+    -- Their history at your client
+    client_co.name AS former_client,
+    client_emp.title AS client_title,
+    client_emp.start_date AS client_start,
+    client_emp.end_date AS client_end,
+    
+    -- Their current role at prospect
+    prospect_emp.title AS prospect_title,
+    prospect_emp.start_date AS prospect_start,
+    
+    -- Recency scoring
+    CASE 
+        WHEN client_emp.end_date >= CURRENT_DATE - INTERVAL '2 years' THEN 'RECENT'
+        WHEN client_emp.end_date >= CURRENT_DATE - INTERVAL '5 years' THEN 'MEDIUM'
+        ELSE 'OLD'
+    END AS connection_recency,
+    
+    -- Numeric score for sorting (1.0 = best)
+    CASE 
+        WHEN client_emp.end_date >= CURRENT_DATE - INTERVAL '1 year' THEN 1.0
+        WHEN client_emp.end_date >= CURRENT_DATE - INTERVAL '2 years' THEN 0.8
+        WHEN client_emp.end_date >= CURRENT_DATE - INTERVAL '5 years' THEN 0.5
+        ELSE 0.3
+    END AS recency_score
+
+FROM people p
+
+-- Their employment at one of your clients (former)
+JOIN employment_history client_emp ON p.id = client_emp.person_id
+JOIN companies client_co ON client_emp.company_id = client_co.id
+
+-- Their employment at the prospect (current)
+JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
+
+WHERE 
+    -- Client side: former employee of a client company
+    client_co.relationship_type = 'CLIENT'
+    AND client_emp.is_current = FALSE
+    
+    -- Prospect side: currently works at the prospect
+    AND prospect_emp.company_id = $prospect_id  -- << Replace with prospect UUID
+    AND prospect_emp.is_current = TRUE
+
+ORDER BY recency_score DESC, client_emp.end_date DESC;
+
+
+-- =============================================================================
+-- QUERY 2: Current employee of client previously worked at prospect
+-- =============================================================================
+-- Someone currently at your client used to work at the prospect.
+-- They might still have contacts there.
+-- =============================================================================
+
+SELECT 
+    p.full_name AS connector_name,
+    p.email,
+    p.linkedin_url,
+    
+    -- Their current role at your client
+    client_co.name AS current_client,
+    client_emp.title AS current_title,
+    client_emp.start_date AS client_start,
+    
+    -- Their history at the prospect
+    prospect_emp.title AS former_prospect_title,
+    prospect_emp.start_date AS prospect_start,
+    prospect_emp.end_date AS prospect_end,
+    
+    -- How long since they left the prospect?
+    CASE 
+        WHEN prospect_emp.end_date >= CURRENT_DATE - INTERVAL '2 years' THEN 'RECENT'
+        WHEN prospect_emp.end_date >= CURRENT_DATE - INTERVAL '5 years' THEN 'MEDIUM'
+        ELSE 'OLD'
+    END AS prospect_recency
+
+FROM people p
+
+-- Currently at one of your clients
+JOIN employment_history client_emp ON p.id = client_emp.person_id
+JOIN companies client_co ON client_emp.company_id = client_co.id
+
+-- Previously at the prospect
+JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
+
+WHERE 
+    client_co.relationship_type = 'CLIENT'
+    AND client_emp.is_current = TRUE
+    
+    AND prospect_emp.company_id = $prospect_id  -- << Replace with prospect UUID
+    AND prospect_emp.is_current = FALSE
+
+ORDER BY prospect_emp.end_date DESC;
+
+
+-- =============================================================================
+-- QUERY 3: Shared PE ownership - Your PE client owns/owned the prospect
+-- =============================================================================
+-- A PE firm that is your client currently owns or previously owned the prospect.
+-- =============================================================================
+
+SELECT 
+    pe.name AS pe_firm_name,
+    pe.id AS pe_firm_id,
+    
+    -- Their ownership of the prospect
+    prospect_own.ownership_percentage,
+    prospect_own.investment_type,
+    prospect_own.acquisition_date,
+    prospect_own.exit_date,
+    prospect_own.status AS ownership_status,
+    
+    -- How many of your clients does this PE firm own?
+    (
+        SELECT COUNT(DISTINCT poh2.company_id)
+        FROM pe_ownership_history poh2
+        JOIN companies c2 ON poh2.company_id = c2.id
+        WHERE poh2.pe_firm_id = pe.id
+          AND c2.relationship_type = 'CLIENT'
+          AND poh2.is_current_holding = TRUE
+    ) AS num_client_companies_owned
+
+FROM pe_firms pe
+JOIN pe_ownership_history prospect_own ON pe.id = prospect_own.pe_firm_id
+
+WHERE 
+    pe.is_client = TRUE  -- PE firm is your client
+    AND prospect_own.company_id = $prospect_id  -- << Replace with prospect UUID
+
+ORDER BY prospect_own.is_current_holding DESC, prospect_own.acquisition_date DESC;
+
+
+-- =============================================================================
+-- QUERY 4: Common PE ownership - Same PE firm owns both client and prospect
+-- =============================================================================
+-- A PE firm owns (or owned) both one of your clients AND the prospect.
+-- Even if the PE firm isn't directly your client, this is a connection.
+-- =============================================================================
+
+SELECT 
+    pe.name AS pe_firm_name,
+    
+    -- Their ownership of your client
+    client_co.name AS client_company,
+    client_own.status AS client_ownership_status,
+    client_own.acquisition_date AS client_acquisition,
+    client_own.exit_date AS client_exit,
+    
+    -- Their ownership of the prospect
+    prospect_own.status AS prospect_ownership_status,
+    prospect_own.acquisition_date AS prospect_acquisition,
+    prospect_own.exit_date AS prospect_exit,
+    
+    -- Did they overlap in time?
+    CASE 
+        WHEN (client_own.acquisition_date, COALESCE(client_own.exit_date, '9999-12-31'))
+             OVERLAPS
+             (prospect_own.acquisition_date, COALESCE(prospect_own.exit_date, '9999-12-31'))
+        THEN 'YES'
+        ELSE 'NO'
+    END AS ownership_overlapped
+
+FROM pe_firms pe
+
+-- PE owns/owned a client
+JOIN pe_ownership_history client_own ON pe.id = client_own.pe_firm_id
+JOIN companies client_co ON client_own.company_id = client_co.id
+
+-- PE owns/owned the prospect
+JOIN pe_ownership_history prospect_own ON pe.id = prospect_own.pe_firm_id
+
+WHERE 
+    client_co.relationship_type = 'CLIENT'
+    AND prospect_own.company_id = $prospect_id  -- << Replace with prospect UUID
+
+ORDER BY 
+    prospect_own.is_current_holding DESC,
+    client_own.is_current_holding DESC;
+
+
+-- =============================================================================
+-- QUERY 5: Mutual former employees (worked at both, even if neither is current)
+-- =============================================================================
+-- Someone who previously worked at both your client and the prospect.
+-- Weaker connection but still valuable.
+-- =============================================================================
+
+SELECT 
+    p.full_name AS connector_name,
+    p.email,
+    p.linkedin_url,
+    
+    -- At the client
+    client_co.name AS client_company,
+    client_emp.title AS client_title,
+    client_emp.start_date AS client_start,
+    client_emp.end_date AS client_end,
+    
+    -- At the prospect
+    prospect_emp.title AS prospect_title,
+    prospect_emp.start_date AS prospect_start,
+    prospect_emp.end_date AS prospect_end,
+    
+    -- Which came first?
+    CASE 
+        WHEN client_emp.start_date < prospect_emp.start_date THEN 'CLIENT_FIRST'
+        ELSE 'PROSPECT_FIRST'
+    END AS employment_order,
+    
+    -- Where are they now?
+    (
+        SELECT c.name 
+        FROM employment_history eh 
+        JOIN companies c ON eh.company_id = c.id
+        WHERE eh.person_id = p.id AND eh.is_current = TRUE
+        LIMIT 1
+    ) AS current_company
+
+FROM people p
+
+-- Worked at a client
+JOIN employment_history client_emp ON p.id = client_emp.person_id
+JOIN companies client_co ON client_emp.company_id = client_co.id
+
+-- Worked at the prospect
+JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
+
+WHERE 
+    client_co.relationship_type = 'CLIENT'
+    AND prospect_emp.company_id = $prospect_id  -- << Replace with prospect UUID
+    
+    -- Both are former (not current at either)
+    AND client_emp.is_current = FALSE
+    AND prospect_emp.is_current = FALSE
+
+ORDER BY 
+    GREATEST(client_emp.end_date, prospect_emp.end_date) DESC NULLS LAST;
+
+
+-- =============================================================================
+-- QUERY 6: Leadership connections (C-suite and executives only)
+-- =============================================================================
+-- Same as Query 1-2 but filtered to senior leadership for high-value intros.
+-- =============================================================================
+
+SELECT 
+    p.full_name AS connector_name,
+    p.email,
+    p.linkedin_url,
+    
+    client_co.name AS client_company,
+    client_emp.title AS client_title,
+    client_emp.seniority_level AS client_level,
+    client_emp.status AS client_status,
+    
+    prospect_emp.title AS prospect_title,
+    prospect_emp.seniority_level AS prospect_level,
+    prospect_emp.status AS prospect_status
+
+FROM people p
+
+JOIN employment_history client_emp ON p.id = client_emp.person_id
+JOIN companies client_co ON client_emp.company_id = client_co.id
+
+JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
+
+WHERE 
+    client_co.relationship_type = 'CLIENT'
+    AND prospect_emp.company_id = $prospect_id  -- << Replace with prospect UUID
+    
+    -- At least one role was leadership-level
+    AND (
+        client_emp.is_leadership = TRUE 
+        OR client_emp.seniority_level IN ('C-SUITE', 'VP', 'DIRECTOR')
+        OR prospect_emp.is_leadership = TRUE
+        OR prospect_emp.seniority_level IN ('C-SUITE', 'VP', 'DIRECTOR')
+    )
+
+ORDER BY 
+    prospect_emp.is_current DESC,
+    client_emp.is_current DESC;
+
+
+-- =============================================================================
+-- QUERY 7: COMPREHENSIVE - All connections for a prospect (ranked)
+-- =============================================================================
+-- The "master query" that finds ALL connection types and ranks them.
+-- Run this when you start researching a new prospect.
+-- =============================================================================
+
+WITH all_connections AS (
+    
+    -- Type 1: Former client employee now at prospect (STRONGEST)
+    SELECT 
+        'FORMER_CLIENT_EMP_NOW_AT_PROSPECT' AS connection_type,
+        p.id AS person_id,
+        p.full_name AS connector_name,
+        p.linkedin_url,
+        client_co.name AS client_entity,
+        NULL::VARCHAR AS pe_entity,
+        client_emp.title AS client_role,
+        prospect_emp.title AS prospect_role,
+        client_emp.end_date AS client_end_date,
+        prospect_emp.start_date AS prospect_start_date,
+        1.0 AS base_weight,  -- Strongest connection type
+        CASE 
+            WHEN client_emp.end_date >= CURRENT_DATE - INTERVAL '1 year' THEN 1.0
+            WHEN client_emp.end_date >= CURRENT_DATE - INTERVAL '2 years' THEN 0.8
+            WHEN client_emp.end_date >= CURRENT_DATE - INTERVAL '5 years' THEN 0.5
+            ELSE 0.3
+        END AS recency_multiplier
+    FROM people p
+    JOIN employment_history client_emp ON p.id = client_emp.person_id
+    JOIN companies client_co ON client_emp.company_id = client_co.id
+    JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
+    WHERE client_co.relationship_type = 'CLIENT'
+      AND client_emp.is_current = FALSE
+      AND prospect_emp.company_id = $prospect_id
+      AND prospect_emp.is_current = TRUE
+
+    UNION ALL
+
+    -- Type 2: Current client employee formerly at prospect
+    SELECT 
+        'CURRENT_CLIENT_EMP_FORMERLY_AT_PROSPECT' AS connection_type,
+        p.id AS person_id,
+        p.full_name AS connector_name,
+        p.linkedin_url,
+        client_co.name AS client_entity,
+        NULL AS pe_entity,
+        client_emp.title AS client_role,
+        prospect_emp.title AS prospect_role,
+        prospect_emp.end_date AS client_end_date,
+        client_emp.start_date AS prospect_start_date,
+        0.9 AS base_weight,
+        CASE 
+            WHEN prospect_emp.end_date >= CURRENT_DATE - INTERVAL '2 years' THEN 0.9
+            WHEN prospect_emp.end_date >= CURRENT_DATE - INTERVAL '5 years' THEN 0.6
+            ELSE 0.3
+        END AS recency_multiplier
+    FROM people p
+    JOIN employment_history client_emp ON p.id = client_emp.person_id
+    JOIN companies client_co ON client_emp.company_id = client_co.id
+    JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
+    WHERE client_co.relationship_type = 'CLIENT'
+      AND client_emp.is_current = TRUE
+      AND prospect_emp.company_id = $prospect_id
+      AND prospect_emp.is_current = FALSE
+
+    UNION ALL
+
+    -- Type 3: PE client currently owns prospect
+    SELECT 
+        'PE_CLIENT_CURRENTLY_OWNS_PROSPECT' AS connection_type,
+        NULL AS person_id,
+        NULL AS connector_name,
+        NULL AS linkedin_url,
+        NULL AS client_entity,
+        pe.name AS pe_entity,
+        NULL AS client_role,
+        NULL AS prospect_role,
+        NULL AS client_end_date,
+        prospect_own.acquisition_date AS prospect_start_date,
+        0.95 AS base_weight,
+        1.0 AS recency_multiplier
+    FROM pe_firms pe
+    JOIN pe_ownership_history prospect_own ON pe.id = prospect_own.pe_firm_id
+    WHERE pe.is_client = TRUE
+      AND prospect_own.company_id = $prospect_id
+      AND prospect_own.is_current_holding = TRUE
+
+    UNION ALL
+
+    -- Type 4: PE client previously owned prospect
+    SELECT 
+        'PE_CLIENT_FORMERLY_OWNED_PROSPECT' AS connection_type,
+        NULL AS person_id,
+        NULL AS connector_name,
+        NULL AS linkedin_url,
+        NULL AS client_entity,
+        pe.name AS pe_entity,
+        NULL AS client_role,
+        NULL AS prospect_role,
+        prospect_own.exit_date AS client_end_date,
+        prospect_own.acquisition_date AS prospect_start_date,
+        0.7 AS base_weight,
+        CASE 
+            WHEN prospect_own.exit_date >= CURRENT_DATE - INTERVAL '2 years' THEN 0.9
+            WHEN prospect_own.exit_date >= CURRENT_DATE - INTERVAL '5 years' THEN 0.6
+            ELSE 0.3
+        END AS recency_multiplier
+    FROM pe_firms pe
+    JOIN pe_ownership_history prospect_own ON pe.id = prospect_own.pe_firm_id
+    WHERE pe.is_client = TRUE
+      AND prospect_own.company_id = $prospect_id
+      AND prospect_own.is_current_holding = FALSE
+
+    UNION ALL
+
+    -- Type 5: Mutual former employee (worked at both client and prospect historically)
+    SELECT 
+        'MUTUAL_FORMER_EMPLOYEE' AS connection_type,
+        p.id AS person_id,
+        p.full_name AS connector_name,
+        p.linkedin_url,
+        client_co.name AS client_entity,
+        NULL AS pe_entity,
+        client_emp.title AS client_role,
+        prospect_emp.title AS prospect_role,
+        GREATEST(client_emp.end_date, prospect_emp.end_date) AS client_end_date,
+        NULL AS prospect_start_date,
+        0.5 AS base_weight,
+        CASE 
+            WHEN GREATEST(client_emp.end_date, prospect_emp.end_date) >= CURRENT_DATE - INTERVAL '3 years' THEN 0.7
+            ELSE 0.4
+        END AS recency_multiplier
+    FROM people p
+    JOIN employment_history client_emp ON p.id = client_emp.person_id
+    JOIN companies client_co ON client_emp.company_id = client_co.id
+    JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
+    WHERE client_co.relationship_type = 'CLIENT'
+      AND client_emp.is_current = FALSE
+      AND prospect_emp.company_id = $prospect_id
+      AND prospect_emp.is_current = FALSE
+)
+
+SELECT 
+    connection_type,
+    connector_name,
+    linkedin_url,
+    COALESCE(client_entity, pe_entity) AS connected_through,
+    client_role,
+    prospect_role,
+    ROUND((base_weight * recency_multiplier)::NUMERIC, 2) AS connection_score
+FROM all_connections
+ORDER BY (base_weight * recency_multiplier) DESC
+LIMIT 50;
+
+
+-- =============================================================================
+-- QUERY 8: Prospect research summary
+-- =============================================================================
+-- Get a quick overview of a prospect: current ownership, leadership, and
+-- connection count to your network.
+-- =============================================================================
+
+SELECT 
+    c.name AS prospect_name,
+    c.industry,
+    c.headquarters_city || ', ' || c.headquarters_state AS location,
+    
+    -- Current PE owner
+    (
+        SELECT pe.name 
+        FROM pe_ownership_history poh 
+        JOIN pe_firms pe ON poh.pe_firm_id = pe.id
+        WHERE poh.company_id = c.id AND poh.is_current_holding = TRUE
+        LIMIT 1
+    ) AS current_pe_owner,
+    
+    -- Leadership count
+    (
+        SELECT COUNT(*) 
+        FROM employment_history eh 
+        WHERE eh.company_id = c.id 
+          AND eh.is_current = TRUE 
+          AND eh.is_leadership = TRUE
+    ) AS current_leadership_count,
+    
+    -- Total connections to your client network
+    (
+        SELECT COUNT(DISTINCT p.id)
+        FROM people p
+        JOIN employment_history client_emp ON p.id = client_emp.person_id
+        JOIN companies client_co ON client_emp.company_id = client_co.id
+        JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
+        WHERE client_co.relationship_type = 'CLIENT'
+          AND prospect_emp.company_id = c.id
+    ) AS total_people_connections,
+    
+    -- Strong connections (former client employees now at prospect)
+    (
+        SELECT COUNT(DISTINCT p.id)
+        FROM people p
+        JOIN employment_history client_emp ON p.id = client_emp.person_id
+        JOIN companies client_co ON client_emp.company_id = client_co.id
+        JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
+        WHERE client_co.relationship_type = 'CLIENT'
+          AND client_emp.is_current = FALSE
+          AND prospect_emp.company_id = c.id
+          AND prospect_emp.is_current = TRUE
+    ) AS strong_connections
+
+FROM companies c
+WHERE c.id = $prospect_id;  -- << Replace with prospect UUID

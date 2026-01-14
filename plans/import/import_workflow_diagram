@@ -1,0 +1,93 @@
+---
+title: Data Import Workflows - Entry Points and Enrichment Chains
+---
+flowchart TB
+    subgraph CLIENT_IMPORT["🏢 CLIENT IMPORT WORKFLOW"]
+        C1[/"Input: Company Name, Dates, Industry"/]
+        C2{Company exists<br/>in database?}
+        C3[Create Company Record<br/>relationship_type = CLIENT]
+        C4[Update existing to CLIENT<br/>+ add dates]
+        C5[Enrich: Find LinkedIn Company Page]
+        C6[Enrich: Find Current PE Owner]
+        C7[Enrich: Find PE Ownership History]
+        C8[Enrich: Find Current Leadership]
+        C9[Enrich: Find Board Members]
+        
+        C1 --> C2
+        C2 -->|No| C3
+        C2 -->|Yes| C4
+        C3 --> C5
+        C4 --> C5
+        C5 --> C6
+        C6 --> C7
+        C7 --> C8
+        C8 --> C9
+    end
+
+    subgraph PE_IMPORT["🏦 PE FIRM IMPORT WORKFLOW"]
+        P1[/"Input: PE Firm Name"/]
+        P2{PE Firm exists<br/>in database?}
+        P3[Create PE Firm Record]
+        P4[Use Existing Record]
+        P5[Enrich: Find Current Portfolio]
+        P6[Enrich: Find Exited Investments]
+        P7[Enrich: Find PE Professionals]
+        
+        P1 --> P2
+        P2 -->|No| P3
+        P2 -->|Yes| P4
+        P3 --> P5
+        P4 --> P5
+        P5 --> P6
+        P6 --> P7
+    end
+
+    subgraph PERSON_IMPORT["👤 PERSON IMPORT WORKFLOW"]
+        R1[/"Input: Name, maybe Company"/]
+        R2[Search LinkedIn for Profile]
+        R3{Person exists<br/>in database?}
+        R4[Create Person Record]
+        R5[Link to Existing Person]
+        R6[Enrich: Scrape Employment History]
+        R7[Enrich: Find Board Seats]
+        
+        R1 --> R2
+        R2 --> R3
+        R3 -->|No| R4
+        R3 -->|Yes| R5
+        R4 --> R6
+        R5 --> R6
+        R6 --> R7
+    end
+
+    subgraph ENTITY_RESOLUTION["🔍 ENTITY RESOLUTION (shared)"]
+        E1[Match on LinkedIn ID]
+        E2[Match on Name + Location]
+        E3[Fuzzy Match Queue]
+        E4[Manual Review]
+    end
+
+    %% Cross-workflow triggers
+    C6 -->|"New PE Firm?"| P1
+    C7 -->|"New PE Firm?"| P1
+    C8 -->|"New Person?"| R1
+    C9 -->|"New Person?"| R1
+    
+    P5 -->|"New Company?"| C1
+    P6 -->|"New Company?"| C1
+    P7 -->|"New Person?"| R1
+    
+    R6 -->|"New Company?"| C1
+
+    %% Entity resolution connections
+    C2 -.-> E1
+    C2 -.-> E2
+    P2 -.-> E2
+    R3 -.-> E1
+    E2 -.-> E3
+    E3 -.-> E4
+
+    style CLIENT_IMPORT fill:#e1f5fe
+    style PE_IMPORT fill:#fff3e0
+    style PERSON_IMPORT fill:#e8f5e9
+    style ENTITY_RESOLUTION fill:#fce4ec
