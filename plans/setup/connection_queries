@@ -58,7 +58,7 @@ JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
 
 WHERE 
     -- Client side: former employee of a client company
-    client_co.relationship_type = 'CLIENT'
+    client_co.is_client = TRUE
     AND client_emp.is_current = FALSE
     
     -- Prospect side: currently works at the prospect
@@ -107,7 +107,7 @@ JOIN companies client_co ON client_emp.company_id = client_co.id
 JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
 
 WHERE 
-    client_co.relationship_type = 'CLIENT'
+    client_co.is_client = TRUE
     AND client_emp.is_current = TRUE
     
     AND prospect_emp.company_id = $prospect_id  -- << Replace with prospect UUID
@@ -122,24 +122,22 @@ ORDER BY prospect_emp.end_date DESC;
 -- A PE firm that is your client currently owns or previously owned the prospect.
 -- =============================================================================
 
-SELECT 
+SELECT
     pe.name AS pe_firm_name,
     pe.id AS pe_firm_id,
-    
+
     -- Their ownership of the prospect
-    prospect_own.ownership_percentage,
-    prospect_own.investment_type,
     prospect_own.acquisition_date,
     prospect_own.exit_date,
     prospect_own.status AS ownership_status,
-    
+
     -- How many of your clients does this PE firm own?
     (
         SELECT COUNT(DISTINCT poh2.company_id)
         FROM pe_ownership_history poh2
         JOIN companies c2 ON poh2.company_id = c2.id
         WHERE poh2.pe_firm_id = pe.id
-          AND c2.relationship_type = 'CLIENT'
+          AND c2.is_client = TRUE
           AND poh2.is_current_holding = TRUE
     ) AS num_client_companies_owned
 
@@ -193,7 +191,7 @@ JOIN companies client_co ON client_own.company_id = client_co.id
 JOIN pe_ownership_history prospect_own ON pe.id = prospect_own.pe_firm_id
 
 WHERE 
-    client_co.relationship_type = 'CLIENT'
+    client_co.is_client = TRUE
     AND prospect_own.company_id = $prospect_id  -- << Replace with prospect UUID
 
 ORDER BY 
@@ -249,7 +247,7 @@ JOIN companies client_co ON client_emp.company_id = client_co.id
 JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
 
 WHERE 
-    client_co.relationship_type = 'CLIENT'
+    client_co.is_client = TRUE
     AND prospect_emp.company_id = $prospect_id  -- << Replace with prospect UUID
     
     -- Both are former (not current at either)
@@ -288,7 +286,7 @@ JOIN companies client_co ON client_emp.company_id = client_co.id
 JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
 
 WHERE 
-    client_co.relationship_type = 'CLIENT'
+    client_co.is_client = TRUE
     AND prospect_emp.company_id = $prospect_id  -- << Replace with prospect UUID
     
     -- At least one role was leadership-level
@@ -336,7 +334,7 @@ WITH all_connections AS (
     JOIN employment_history client_emp ON p.id = client_emp.person_id
     JOIN companies client_co ON client_emp.company_id = client_co.id
     JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
-    WHERE client_co.relationship_type = 'CLIENT'
+    WHERE client_co.is_client = TRUE
       AND client_emp.is_current = FALSE
       AND prospect_emp.company_id = $prospect_id
       AND prospect_emp.is_current = TRUE
@@ -365,7 +363,7 @@ WITH all_connections AS (
     JOIN employment_history client_emp ON p.id = client_emp.person_id
     JOIN companies client_co ON client_emp.company_id = client_co.id
     JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
-    WHERE client_co.relationship_type = 'CLIENT'
+    WHERE client_co.is_client = TRUE
       AND client_emp.is_current = TRUE
       AND prospect_emp.company_id = $prospect_id
       AND prospect_emp.is_current = FALSE
@@ -441,7 +439,7 @@ WITH all_connections AS (
     JOIN employment_history client_emp ON p.id = client_emp.person_id
     JOIN companies client_co ON client_emp.company_id = client_co.id
     JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
-    WHERE client_co.relationship_type = 'CLIENT'
+    WHERE client_co.is_client = TRUE
       AND client_emp.is_current = FALSE
       AND prospect_emp.company_id = $prospect_id
       AND prospect_emp.is_current = FALSE
@@ -497,7 +495,7 @@ SELECT
         JOIN employment_history client_emp ON p.id = client_emp.person_id
         JOIN companies client_co ON client_emp.company_id = client_co.id
         JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
-        WHERE client_co.relationship_type = 'CLIENT'
+        WHERE client_co.is_client = TRUE
           AND prospect_emp.company_id = c.id
     ) AS total_people_connections,
     
@@ -508,7 +506,7 @@ SELECT
         JOIN employment_history client_emp ON p.id = client_emp.person_id
         JOIN companies client_co ON client_emp.company_id = client_co.id
         JOIN employment_history prospect_emp ON p.id = prospect_emp.person_id
-        WHERE client_co.relationship_type = 'CLIENT'
+        WHERE client_co.is_client = TRUE
           AND client_emp.is_current = FALSE
           AND prospect_emp.company_id = c.id
           AND prospect_emp.is_current = TRUE

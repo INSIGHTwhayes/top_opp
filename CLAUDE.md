@@ -15,17 +15,20 @@ This is a **relationship tracking system** for a consulting firm to find connect
 The schema uses **SCD Type 2 pattern** for temporal tracking with `start_date`, `end_date`, and computed `is_current` columns.
 
 **Core entities**:
-- `companies` - Tagged as CLIENT, PROSPECT, or OTHER (unified table, not separate)
-- `people` - Shared across all companies
+- `companies` - Uses `is_client` and `is_prospect` boolean flags (can be both, neither, or one)
+- `people` - Shared across all companies; `is_known_contact` distinguishes your network from discovered people
 - `pe_firms` - Private equity firms
 
 **Relationship tables** (all with temporal tracking):
 - `employment_history` - Links people to companies with dates
-- `pe_ownership_history` - Links PE firms to companies with acquisition/exit dates
+- `pe_ownership_history` - Links PE firms to companies with acquisition/exit dates (simplified: no ownership %)
 - `board_memberships` - Board seats
 - `pe_professionals` - PE firm employees
 
-**Key design decision**: Single unified schema where entities can connect both client and prospect sides, rather than separate schemas.
+**Key design decisions**:
+- Most companies are NOT clients - they come from PE portfolio imports, employment history, etc.
+- `is_client` and `is_prospect` are independent booleans (not mutually exclusive)
+- `is_known_contact` on people distinguishes CRM contacts from discovered people
 
 ### Data Import Workflows (n8n)
 

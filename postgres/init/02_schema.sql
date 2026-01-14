@@ -8,8 +8,11 @@
 -- Key Design Decisions:
 -- 1. Single unified schema (not separate schemas for clients vs prospects)
 -- 2. SCD Type 2 pattern for temporal tracking (start_date, end_date, is_current)
--- 3. Companies tagged as CLIENT, PROSPECT, or OTHER (not separate tables)
--- 4. People and PE firms are shared entities that can connect both sides
+-- 3. Most companies are NOT clients - they come from PE portfolio imports,
+--    employment history lookups, etc. Client status is explicitly set.
+-- 4. is_client and is_prospect are NOT mutually exclusive (can be both)
+-- 5. is_known_contact distinguishes your actual network from discovered people
+-- 6. People and PE firms are shared entities that can connect both sides
 -- =============================================================================
 
 -- =============================================================================
@@ -37,19 +40,17 @@ CREATE TABLE companies (
     headquarters_state VARCHAR(100),
     headquarters_country VARCHAR(100) DEFAULT 'USA',
 
-    -- Your relationship to this company
-    relationship_type VARCHAR(20) NOT NULL DEFAULT 'OTHER'
-        CHECK (relationship_type IN ('CLIENT', 'PROSPECT', 'OTHER')),
-
-    -- If CLIENT: when did they become/stop being a client?
+    -- Client tracking (explicit, not assumed - most companies are NOT clients)
+    is_client BOOLEAN NOT NULL DEFAULT FALSE,
     client_start_date DATE,
     client_end_date DATE,
     -- Note: is_active_client is computed by trigger since CURRENT_DATE is not immutable
-    is_active_client BOOLEAN DEFAULT FALSE,
+    is_active_client BOOLEAN NOT NULL DEFAULT FALSE,
 
-    -- If PROSPECT: tracking info
+    -- Prospect tracking (separate concern from client status)
+    is_prospect BOOLEAN NOT NULL DEFAULT FALSE,
     prospect_added_date DATE,
-    prospect_status VARCHAR(50),  -- e.g., 'RESEARCHING', 'QUALIFIED', 'PITCHED', 'CLOSED'
+    prospect_status VARCHAR(50),  -- 'RESEARCHING', 'QUALIFIED', 'PITCHED', 'CLOSED_WON', 'CLOSED_LOST'
 
     -- Metadata
     notes TEXT,
@@ -58,7 +59,8 @@ CREATE TABLE companies (
 );
 
 -- Indexes for company queries
-CREATE INDEX idx_companies_relationship ON companies(relationship_type);
+CREATE INDEX idx_companies_is_client ON companies(is_client) WHERE is_client = TRUE;
+CREATE INDEX idx_companies_is_prospect ON companies(is_prospect) WHERE is_prospect = TRUE;
 CREATE INDEX idx_companies_active_client ON companies(is_active_client) WHERE is_active_client = TRUE;
 CREATE INDEX idx_companies_name ON companies(name);
 CREATE INDEX idx_companies_industry ON companies(industry);
@@ -112,6 +114,12 @@ CREATE TABLE people (
     -- For matching/deduplication
     linkedin_id VARCHAR(100),  -- Extracted from LinkedIn URL, useful for dedup
 
+    -- Contact classification
+    -- Known contacts: people you have actual relationships with (CRM, direct connections)
+    -- Discovered: found through enrichment (LinkedIn scrapes, PE research, etc.)
+    is_known_contact BOOLEAN NOT NULL DEFAULT FALSE,
+    contact_source VARCHAR(100),  -- 'CRM_IMPORT', 'MANUAL_ENTRY', 'LINKEDIN_SCRAPE', 'PE_RESEARCH', etc.
+
     -- Metadata
     notes TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -121,6 +129,7 @@ CREATE TABLE people (
 CREATE INDEX idx_people_name ON people(last_name, first_name);
 CREATE INDEX idx_people_email ON people(email) WHERE email IS NOT NULL;
 CREATE INDEX idx_people_linkedin ON people(linkedin_id) WHERE linkedin_id IS NOT NULL;
+CREATE INDEX idx_people_known_contact ON people(is_known_contact) WHERE is_known_contact = TRUE;
 
 -- =============================================================================
 -- RELATIONSHIP TABLES (with temporal tracking)
@@ -189,12 +198,7 @@ CREATE TABLE pe_ownership_history (
     pe_firm_id UUID NOT NULL REFERENCES pe_firms(id) ON DELETE CASCADE,
     company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
 
-    -- Ownership details
-    ownership_percentage DECIMAL(5, 2),  -- e.g., 75.50 for 75.5%
-    investment_type VARCHAR(50),  -- e.g., 'MAJORITY', 'MINORITY', 'PLATFORM', 'ADD-ON'
-    deal_type VARCHAR(50),  -- e.g., 'BUYOUT', 'GROWTH', 'RECAP'
-
-    -- Temporal tracking
+    -- Temporal tracking (only what's needed for connection-finding)
     acquisition_date DATE,
     exit_date DATE,  -- NULL means current holding
     is_current_holding BOOLEAN GENERATED ALWAYS AS (exit_date IS NULL) STORED,
@@ -344,7 +348,7 @@ SELECT
 FROM companies c
 JOIN employment_history eh ON c.id = eh.company_id
 JOIN people p ON eh.person_id = p.id
-WHERE c.relationship_type = 'CLIENT'
+WHERE c.is_client = TRUE
   AND eh.is_current = TRUE;
 
 -- -----------------------------------------------------------------------------
@@ -366,7 +370,7 @@ SELECT
 FROM companies c
 JOIN employment_history eh ON c.id = eh.company_id
 JOIN people p ON eh.person_id = p.id
-WHERE c.relationship_type = 'CLIENT';
+WHERE c.is_client = TRUE;
 
 -- -----------------------------------------------------------------------------
 -- View: Current PE ownership of companies
@@ -375,10 +379,10 @@ CREATE VIEW v_current_pe_ownership AS
 SELECT
     c.id AS company_id,
     c.name AS company_name,
-    c.relationship_type,
+    c.is_client,
+    c.is_prospect,
     pe.id AS pe_firm_id,
     pe.name AS pe_firm_name,
-    poh.ownership_percentage,
     poh.acquisition_date
 FROM companies c
 JOIN pe_ownership_history poh ON c.id = poh.company_id
@@ -421,7 +425,7 @@ CREATE OR REPLACE FUNCTION compute_is_active_client()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.is_active_client := (
-        NEW.relationship_type = 'CLIENT'
+        NEW.is_client = TRUE
         AND NEW.client_start_date IS NOT NULL
         AND (NEW.client_end_date IS NULL OR NEW.client_end_date > CURRENT_DATE)
     );
